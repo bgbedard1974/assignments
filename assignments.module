@@ -1,0 +1,273 @@
+<?php
+
+/** Hooks **/
+
+/**
+
+ * Implements hook_nodeapi()
+
+ * When a user is viewing an assignments node, change what the user sees based on if they have Staff, Facilitator or Learner role.
+
+ * A Learner sees a link to the Course Work node they submitted. If they have not submitted anything yet, they see a link to create a Course Work node.
+
+ * A Facilitator or Staff sees a table of all the Learners in the Community. If a Learner has created Course Work, then a link to that node is provided. A date the Course Work was create on is also displayed. This way a Facilitator/Staff can see at a glance which Learners have and have not completed the Assignment.
+ */
+function assignments_nodeapi(&$node, $op, $teaser, $page)
+{
+    switch($op) {
+        case 'view':
+
+        global $user;
+
+        if ($node->type === 'assignment') {
+            if (in_array('Learner',$user->roles)) {
+                $query = "SELECT content_type_course_work.nid , node.title FROM {content_type_course_work},{node} WHERE content_type_course_work.nid = node.nid AND content_type_course_work.field_work_assignment_nid = %d AND node.uid = %d";
+                $result = db_query($query, $node->nid, $user->uid);
+                $row = db_fetch_object($result);
+
+                if ($row->nid !== "") {
+                    $work_url = l($row->title,"node/" . $row->nid);
+                    $course_work = "<p><b>My Work:</b> " . $work_url . "</p>\n\n";
+                }
+                else {
+                  $course_work = l("Add Course Work", "node/add/course-work/" . $node->nid);
+                }
+
+                $node->content['assignments-course-work-link'] = array(
+                    '#weight' => 9,
+                    '#value' => $course_work,
+                    );
+            }
+
+            if ( (in_array("Facilitator", $user->roles)) || (in_array("Staff", $user->roles)) )
+            {
+                $output = "";
+                $aid = $node->nid;
+                $cid = $node->field_assign_community[0]['nid'];
+
+                // Get a list of all Learners in a Community
+                $users = med_get_users_by_community($cid, 'lnr');
+
+                $rows = array();
+                foreach ($users as $current_user) {
+                    $learner_work = assignments_get_learner_work($current_user, $aid);
+
+                    $learner_uid = $learner_work['uid'];
+                    $rows[$learner_uid] = assignments_format_learner_work($learner_work);
+                }
+
+
+                $header = array('Learner', 'Submitted?', 'Posted On');
+                $output .= theme_table($header, $rows, $attributes = array(), $caption = 'Submitted Work');
+
+                $node->content['assignments-submitted-work'] = array(
+                    '#weight' => 10,
+                    '#value' => $output
+                );
+
+            }
+        }
+
+        break;
+    }
+
+}
+
+/**
+
+ * Implements hook_menu()
+
+ */
+function assignments_menu()
+{
+    // This page is for Facilitators to see all the assignments they have created for a Community.
+     $items['assignments_menu_item'] = array(
+        'title' => 'Assignments',
+        'page callback' => 'get_assignments_page',
+        'access callback' => TRUE,
+        'menu_name' => 'menu-assignments',
+        'type' => MENU_CALLBACK,
+     );
+
+     // This page is for Learners to see all assignments that they have not created Course Work for.
+     $items['assignments_due'] = array(
+        'title' => 'Assignments Due',
+        'page callback' => 'get_assignments_due_page',
+        'access callback' => TRUE,
+        'menu_name' => 'menu-assignments',
+        'type' => MENU_CALLBACK,
+     );
+     return $items;
+}
+
+
+/** Page callbacks **/
+
+/**
+
+ * Displays a link to create a new Assignment and a view that shows all the assignments by a Facilitor for the Community.
+
+ * @return string
+
+ */
+function get_assignments_page()
+{
+    $output = '';
+
+    $user_vars = assignments_get_user_vars();
+
+    if ($user_vars['isFac'] === true)
+    {
+        $output .= '<p><a href="'. url('node/add/assignment') . '">Create Assignment</a></p>';
+    }
+
+    $output .= views_embed_view('assignments_by_user', 'page', $user_vars['cid']);
+
+    return t($output);
+}
+
+/**
+
+ * Displays a view that shows all the assignments that have not been completed by a Learner.
+
+ * @return string
+
+ */
+
+function get_assignments_due_page()
+{
+    $output = '';
+
+    $user_vars = assignments_get_user_vars();
+
+    if ($user_vars['isLnr'] === true)
+    {
+        $output .= views_embed_view('assignments_due_by_user', 'page', $user_vars['cid']);
+    }
+
+    return t($output);
+}
+
+
+/** Helper functions **/
+
+/**
+
+ * Given a user object, determine the node id for the Community a user belongs to.
+
+ * @return int
+ */
+function assignments_get_community_nid($user)
+{
+    $nid = 0;
+    $community = $user->profile_community;
+    $query = "SELECT nid FROM {node} WHERE type='community' AND title='%s'";
+    $result = db_query($query, $community);
+    $record = db_fetch_object($result);
+    $nid = $record->nid;
+    return $nid;
+}
+
+/**
+
+ * Given a user object and a Role, determine if the user has the role.
+
+ * @param string $role
+ * @param object $user
+
+ * @return bool
+ */
+function assignments_has_role($role, $user)
+{
+    return in_array($role, $user->roles);
+}
+
+
+/**
+
+ * Using the global $user variable, determine what Community the user belongs to and determine if they are a Learner or Facilitator.
+
+ * @return array
+ */
+function assignments_get_user_vars()
+{
+    global $user;
+    $user_vars = array(
+        'cid' => assignments_get_community_nid($user),
+        'isLnr' => assignments_has_role('Learner', $user),
+        'isFac' => assignments_has_role('Facilitator', $user)
+    );
+    return $user_vars;
+}
+
+
+/**
+
+ * Get information on a Learner's work submitted for a given Assignment node id.
+
+ * @param array $user
+ * @param int $aid Assignment node id
+
+ * @return array
+ */
+function assignments_get_learner_work($user, $aid)
+{
+    $learner_work = array(
+        'uid' => $user['uid'],
+        'fname' => $user['fname'],
+        'lname' => $user['lname'],
+        'url' => "",
+        'posted' => ""
+    );
+
+    $work_nid = assignments_get_course_work_by_learner($learner_work['uid'], $aid);
+    if ($work_nid !== null) {
+        $work_node = node_load($work);
+        $learner_work['url'] = $work_node->nid;
+        $learner_work['posted'] = date("m/d/Y", $work_node->created);                }
+    }
+
+    return $learner_work;
+}
+
+/**
+
+ * Format the information from a Learner's Work for display in a table row.
+
+ * @param array $learner_work Information about a Learner's Work
+
+ * @return array
+ */
+function assignments_format_learner_work($learner_work)
+    {
+        $name = $learner_work['fname'] . " " . $learner_work['lname'];
+        $submitted = "";
+
+        if ($learner_work['url'] !== "") {
+            $submitted = "<a href=\"/node/" . $learner_work['url'] . "\">YES</a>";
+        }
+        else {
+            $submitted = "<b>NO</b>";
+        }
+
+        $row = array($name, $submitted, $learner_work['posted']);
+        return $row;
+    }
+}
+
+/**
+
+ * Get the Course Work node id for the node created by the given user that is associated with the given Assignment node id.
+
+ * @param int $uid User node id
+ * @param int $aid Assignment node id
+
+ * @return int
+ */
+function assignments_get_course_work_by_learner($uid, $aid)
+{
+    $query = "SELECT * FROM {content_type_course_work} JOIN {node} ON content_type_course_work.nid = node.nid WHERE node.type = 'course_work' AND node.uid = %d AND content_type_course_work.field_work_assignment_nid = %d";
+    $result = db_query($query, $uid, $aid);
+    $row = db_fetch_object($result);
+    return $row->nid;
+}

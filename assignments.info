@@ -1,0 +1,3 @@
+name = Assignments
+description = Provides support for the Assignment System.
+core = 6.x
